@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>3D Earth Satellite Tracker</title>
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; background: #000; color: white; overflow: hidden; }
+    canvas { display: block; }
+    #ui-left { position: absolute; top: 10px; left: 10px; width: 280px; background: rgba(0,0,0,0.6); padding: 15px; border-radius: 8px; z-index: 10; }
+    #search-input { width: 100%; padding: 8px; margin-bottom: 10px; box-sizing: border-box; }
+    #search-btn { width: 100%; padding: 8px; background: #1e90ff; border: none; color: white; cursor: pointer; }
+    #results { max-height: 250px; overflow-y: auto; margin-top: 10px; }
+    .result { padding: 8px; cursor: pointer; border-bottom: 1px solid #444; }
+    .result:hover { background: #333; }
+    #favorites { margin-top: 20px; }
+    #ui-right { position: absolute; top: 10px; right: 10px; width: 280px; background: rgba(0,0,0,0.6); padding: 15px; border-radius: 8px; z-index: 10; }
+  </style>
+</head>
+<body>
+
+  <div id="ui-left">
+    <input id="search-input" type="text" placeholder="e.g. ISS, STARLINK, COSMOS DEB" />
+    <button id="search-btn">Search Satellites</button>
+    <div id="results"></div>
+    <div id="favorites">
+      <h3>Favorites</h3>
+      <ul id="fav-list"></ul>
+    </div>
+  </div>
+
+  <div id="ui-right">
+    <h3>Selected Info</h3>
+    <div id="info">Click a satellite to see details</div>
+  </div>
+
+  <!-- Libraries via CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.168.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.168.0/examples/js/controls/OrbitControls.min.js"></script>
+  <script src="https://unpkg.com/satellite.js@4.1.3/dist/satellite.min.js"></script>
+
+  <script>
+    // ────────────────────────────────────────────────
+    // Scene Setup
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enablePan = false;
+    controls.minDistance = 1.2;
+    controls.maxDistance = 5;
+
+    // Earth
+    const earthGeo = new THREE.SphereGeometry(1, 64, 64);
+    const earthTex = new THREE.TextureLoader().load('earth.jpg'); // your file
+    const earthMat = new THREE.MeshPhongMaterial({ map: earthTex });
+    const earth = new THREE.Mesh(earthGeo, earthMat);
+    scene.add(earth);
+
+    // Lights
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+    const sunLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    sunLight.position.set(5, 3, 5);
+    scene.add(sunLight);
+
+    camera.position.set(0, 0, 2.5);
+
+    // ────────────────────────────────────────────────
+    // Data & Objects
+    const satellites = {}; // norad → {mesh, satrec, name, orbitLinePast, orbitLineFuture, ...}
+    let selectedNorad = null;
+    let favorites = JSON.parse(localStorage.getItem('satFavorites')) || [];
+
+    const SCALE = 0.0001;          // Earth radius = 6371 km → scale down for viz
+    const EARTH_RADIUS_KM = 6371;
+
+    // ────────────────────────────────────────────────
+    // Helpers
+    function eciToThree(pos) {
+      // ECI from satellite.js → Three.js (x right, y up, z out screen)
+      return new THREE.Vector3(pos.x * SCALE, pos.z * SCALE, pos.y * SCALE);
+    }
+
+    function updatePositions() {
+      const now = new Date();
+      Object.values(satellites).forEach(sat => {
+        if (!favorites.includes(sat.norad) && sat.norad !== selectedNorad) return;
+
+        const pv = satellite.propagate(sat.satrec, now);
+        if (pv.position) {
+          const vec = eciToThree(pv.position);
+          sat.mesh.position.copy(vec);
+        }
+      });
+    }
+
+    function drawOrbit(norad, isFuture = false) {
+      const sat = satellites[norad];
+      if (!sat) return;
+
+      const now = Date.now() / 1000;
+      const points = [];
+      const stepSec = 60; // every minute
+      const durationSec = isFuture ? 45 * 60 : -90 * 60; // future 45 min, past ~1.5 orbits
+      const dir = isFuture ? 1 : -1;
+      const steps = Math.abs(durationSec) / stepSec;
+
+      for (let i = 0; i <= steps; i++) {
+        const t = now + dir * i * stepSec;
+        const pv = satellite.propagate(sat.satrec, new Date(t * 1000));
+        if (pv.position) points.push(eciToThree(pv.position));
+      }
+
+      const geo = new THREE.BufferGeometry().setFromPoints(points);
+      const mat = new THREE.LineBasicMaterial({ color: isFuture ? 0xff00ff : 0x00ff00 });
+      const line = new THREE.Line(geo, mat);
+
+      if (isFuture) {
+        if (sat.orbitLineFuture) scene.remove(sat.orbitLineFuture);
+        sat.orbitLineFuture = line;
+      } else {
+        if (sat.orbitLinePast) scene.remove(sat.orbitLinePast);
+        sat.orbitLinePast = line;
+      }
+      scene.add(line);
+    }
+
+    function showInfo(norad) {
+      const sat = satellites[norad];
+      if (!sat) return;
+
+      const e = sat.satrec.ecco;
+      const a = sat.satrec.a * EARTH_RADIUS_KM; // semi-major in km
+      const apo = (a * (1 + e) - EARTH_RADIUS_KM).toFixed(1);
+      const peri = (a * (1 - e) - EARTH_RADIUS_KM).toFixed(1);
+      const inc = (sat.satrec.inclo * 180 / Math.PI).toFixed(2);
+
+      document.getElementById('info').innerHTML = `
+        <b>${sat.name}</b><br>
+        NORAD: ${norad}<br>
+        Apoapsis: ${apo} km<br>
+        Periapsis: ${peri} km<br>
+        Inclination: ${inc}°<br>
+        <button onclick="toggleFav(${norad})">${favorites.includes(norad) ? 'Remove Favorite' : 'Add Favorite'}</button>
+      `;
+    }
+
+    window.toggleFav = function(norad) {
+      if (favorites.includes(norad)) {
+        favorites = favorites.filter(n => n !== norad);
+      } else {
+        favorites.push(norad);
+      }
+      localStorage.setItem('satFavorites', JSON.stringify(favorites));
+      updateFavList();
+    };
+
+    function updateFavList() {
+      const ul = document.getElementById('fav-list');
+      ul.innerHTML = '';
+      favorites.forEach(norad => {
+        const li = document.createElement('li');
+        li.textContent = satellites[norad]?.name || `NORAD ${norad}`;
+        li.style.cursor = 'pointer';
+        li.onclick = () => loadAndSelect(norad);
+        ul.appendChild(li);
+      });
+    }
+
+    // ────────────────────────────────────────────────
+    // Search & Load
+    async function searchSatellites(term) {
+      const resultsDiv = document.getElementById('results');
+      resultsDiv.innerHTML = 'Searching...';
+
+      try {
+        // CelesTrak name search (public, no key)
+        const url = `https://celestrak.org/NORAD/elements/gp.php?NAME=${encodeURIComponent(term)}*&FORMAT=json-pretty`;
+        const res = await fetch(url);
+        const data = await res.json();
+
+        resultsDiv.innerHTML = '';
+        if (!data.length) {
+          resultsDiv.textContent = 'No matches found';
+          return;
+        }
+
+        data.forEach(s => {
+          const div = document.createElement('div');
+          div.className = 'result';
+          div.textContent = `${s.OBJECT_NAME} (NORAD: ${s.NORAD_CAT_ID})`;
+          div.onclick = () => loadAndSelect(s.NORAD_CAT_ID, s.OBJECT_NAME);
+          resultsDiv.appendChild(div);
+        });
+      } catch (err) {
+        resultsDiv.textContent = 'Error: ' + err.message;
+      }
+    }
+
+    async function loadAndSelect(norad, name = null) {
+      if (satellites[norad]) {
+        selectSat(norad);
+        return;
+      }
+
+      try {
+        // Get latest TLE from keeptrack.space (public)
+        const res = await fetch(`https://api.keeptrack.space/v2/sat/${norad}`);
+        const data = await res.json();
+
+        if (!data.TLE_LINE_1) throw new Error('No TLE found');
+
+        const satrec = satellite.twoline2satrec(data.TLE_LINE_1, data.TLE_LINE_2);
+
+        // Create visual dot
+        const geo = new THREE.SphereGeometry(0.015, 12, 12);
+        const mat = new THREE.MeshBasicMaterial({ color: 0xff4444 });
+        const mesh = new THREE.Mesh(geo, mat);
+        scene.add(mesh);
+
+        satellites[norad] = {
+          norad,
+          name: name || data.NAME || `Sat ${norad}`,
+          satrec,
+          mesh
+        };
+
+        selectSat(norad);
+      } catch (err) {
+        alert('Failed to load satellite: ' + err.message);
+      }
+    }
+
+    function selectSat(norad) {
+      // Clear previous orbit lines if changing
+      if (selectedNorad && selectedNorad !== norad) {
+        const prev = satellites[selectedNorad];
+        if (prev) {
+          if (prev.orbitLinePast) scene.remove(prev.orbitLinePast);
+          if (prev.orbitLineFuture) scene.remove(prev.orbitLineFuture);
+        }
+      }
+
+      selectedNorad = norad;
+      drawOrbit(norad, false);     // past
+      drawOrbit(norad, true);      // future 45 min
+      showInfo(norad);
+    }
+
+    // ────────────────────────────────────────────────
+    // Animation Loop
+    function animate() {
+      requestAnimationFrame(animate);
+      earth.rotation.y += 0.0003; // gentle spin
+      updatePositions();
+      controls.update();
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // Events
+    document.getElementById('search-btn').onclick = () => {
+      const term = document.getElementById('search-input').value.trim();
+      if (term) searchSatellites(term);
+    };
+
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+
+    updateFavList(); // load saved favorites on start
+  </script>
+</body>
+</html>
